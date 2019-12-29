@@ -1,0 +1,1285 @@
+---
+title: "Medical ML"
+author: "Natalie Rozak"
+date: "12/21/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r global imports, warning=FALSE, message=FALSE} 
+# global imports
+# data preprocessing
+library(plyr)
+library(tidyverse)
+library(caret)
+library(fastDummies)
+# data visualization
+library(ggplot2)
+library(car)
+library(ROCR)
+# machine learning
+library(glmnet)
+library(class)
+library(reshape2)
+library(tree)
+library(maptree)
+library(randomForest)
+library(gbm)
+library(e1071)
+
+# supress scientific notation
+options(scipen=999)
+```
+
+# Data Preprocessing
+
+## Raw Data
+```{r import data}
+# import data
+raw_data <- read.csv('~/Documents/GitHub/DSC_Medical_ML/stroke.csv')
+# output structure of the data
+str(raw_data)
+# output summary of each variable
+summary(raw_data)
+# output number of missing values in each variable
+sapply(raw_data, function(x) sum(is.na(x)))
+```
+## Clean Data
+
+Steps to clean the data:
+
+1. Remove id column
+  + id is a unique identifier that does not provide helpful predictive information
+2. Remove rows where gender='Other'
+  + There are only 11 observations where gender='Other'
+  + Having a category with very few observations will be challenging for the models to learn
+3. Convert gender to a factor
+4. Set empty levels of smoking_status to 'unknown'
+5. Set missing values in bmi to the median of bmi
+  + The distribution of bmi is bell-shaped with large outliers
+  + The median is a more robust metric than the mean
+6. Filter data where age >= 34.82
+  + age=34.82 is the first percentile of age where an observation had a stroke
+  + Since most people don't get strokes until later in life, I will limit my model to only consider older people
+7. Remove observations where work_type = 'Never_worked'
+  + After cleaning the data, there are only 3 observations in this category
+8. Convert work_type to a factor
+  + This removes empty levels
+```{r simple data cleaning}
+# create data frame
+clean_data <- raw_data
+# remove id column
+clean_data <- clean_data %>% select(-c(id))
+# remove observations where gender = 'Other'
+clean_data <- clean_data %>% subset(clean_data$gender != 'Other')
+# convert gender to a factor
+clean_data$gender <- factor(clean_data$gender)
+# change empty levelvs in smoking_status to 'unknown'
+levels(clean_data$smoking_status)[1] <- "unknown"
+# summary of the data
+summary(clean_data)
+```
+
+```{r bmi histogram, fig.align='center', fig.width=10, fig.height=8}
+# histogram of bmi
+ggplot(data=subset(clean_data, !is.na(bmi)), aes(x=bmi)) +
+  geom_histogram(binwidth=3) + 
+  ggtitle('BMI Score Histogram')
+```
+
+From the histogram, we see the BMI scores are bell-shaped, but skewed to the right. Because of this, I will replace missing values with the median. The median is a robust measure of central tendency, so it shouldn't be negatively affected by the outliers.
+```{r bmi convert missing values}
+# convert bmi missing values to the median
+clean_data <- clean_data %>% mutate(bmi=ifelse(is.na(bmi), 
+                                               median(bmi, na.rm=TRUE), bmi))
+# confirm missing values were removed
+summary(clean_data$bmi)
+```
+
+```{r age distribution, fig.align='center', fig.width=10, fig.height=8}
+# plot density distribution for age and stroke
+p <- ggplot(clean_data, mapping=aes(x=age, fill=as.factor(stroke),
+                               color=as.factor(stroke)))
+p + geom_density(alpha=0.3) + ggtitle('Density Plot for Age Colored by Stroke')
+```
+
+The density plot shows most people don't get strokes until later in life. 
+```{r quantiles of ages}
+# obtain quantiles of ages that people have strokes
+stroke_ages <- clean_data$age[clean_data$stroke==1]
+summary(stroke_ages)
+```
+
+When examining the ages of people who have strokes, I see most people have strokes later in life. 
+```{r first percentile of stroke age}
+# output the first percentile of stroke age
+stroke_ages %>% quantile(c(0.01))
+```
+
+The first percentile of people who have had strokes is 34.82 years old. 
+```{r remove ages}
+# remove observations with age<34.82
+clean_data <- clean_data %>% subset(clean_data$age >= 34.82)
+# summary of the data
+summary(clean_data)
+```
+
+I chose to remove observations where age<34.82. Most people don't have strokes until later in life, as shown both by the data and proven from my prior knowledge about strokes. Therefore, it seems reasonable to limit my models to only consider older people. Including younger ages in the data will teach the model to classify solely based on age, and the model will be very imprecise for older ages. 
+```{r remove observations with never worked}
+# remove observations were work_type='Never_worked'
+clean_data <- clean_data %>% subset(clean_data$work_type != 'Never_worked')
+# make work_type a factor
+clean_data$work_type <- factor(clean_data$work_type)
+```
+
+```{r create model data}
+# create model_data out of clean_data
+model_data <- clean_data
+# structure of model data
+str(model_data)
+# summary of model data variables
+summary(model_data)
+```
+
+## Prepare Data for Machine Learning
+
+Steps to Prepare Data for Machine Learning
+
+1. Downsample the data
+2. Split the data into train and test
+3. Convert the data into various formats so it is usable for each model
+  + Indicator variables for categorical data
+  + Scaled predictors for distance models
+  + Matrix format
+
+```{r number of observations that have and don't have a stroke}
+# number of observations that have not had a stroke
+length(model_data$stroke[model_data$stroke==0])
+# number of observations that 
+length(model_data$stroke[model_data$stroke==1])
+```
+
+Most observations have not had a stroke, meaning our data is imbalanced. If I keep my data as is, my models will have very high accuracy rates, but they won't generate good insights about patients who have strokes.I can expect the models to properly classify the patients that don't have strokes, and for there to be large misclassifications for patients with strokes. This is problematic since I want to predict whether a person has had a stroke.
+```{r downsample data}
+set.seed(3)
+# downsample data
+data_down <- downSample(x=select(model_data, -c(stroke)), 
+                        y=as.factor(model_data$stroke))
+# structure of downsampled data
+str(data_down)
+# summary of downsampled data
+summary(data_down)
+```
+
+I chose to downsample my data. Unfortunately, this means a lot of my information about patients who have not had a stroke has been lost. However, if I upsampled my data, there would have been many repeats of observations and the models would be prone to overfitting or incorrectly reporting high accuracy rates by training and testing the models on the same data. 
+```{r split data into train and test}
+# arguments for splitting data
+n <- nrow(data_down)
+set.seed(6)
+ind_train <- sample.int(n, 0.8*n) 
+# train data set
+train_full <- data_down[ind_train,]
+# test data set
+test_full <- data_down[-ind_train,]
+# summary of train data set
+summary(train_full)
+# summary of test data set
+summary(test_full)
+```
+```{r make dummy data}
+# get indicator random variables for categorical data
+dummy_data <- dummy_cols(data_down, remove_first_dummy=TRUE)
+# remove redundant columns
+dummy_data <- dummy_data %>% select(-c(gender, ever_married, work_type, 
+                                       Residence_type, smoking_status, Class_1))
+# output structure
+str(dummy_data)
+```
+```{r make additional data frames for machine learning models}
+# dummy data train and test
+train_dummy <- dummy_data[ind_train,]
+test_dummy <- dummy_data[-ind_train,]
+# matrix dummy data train and test
+X_train_mat <- model.matrix(Class~., data=train_dummy)[,-1]
+X_test_mat <- model.matrix(Class~., data=test_dummy)[,-1]
+# scale dummy data train and test
+train_dummy_scaled <- train_dummy %>% mutate_if(is.numeric, scale)
+test_dummy_scaled <- test_dummy %>% mutate_if(is.numeric, scale)
+# scaled dummy data predictors
+X_train_dummy_scaled <- train_dummy_scaled %>% select(-c(Class))
+X_test_dummy_scaled <- test_dummy_scaled %>% select(-c(Class))
+# response data in various forms
+Y_train <- train_dummy_scaled$Class
+Y_test <- test_dummy_scaled$Class
+Y_train_num <- as.numeric(as.character(train_dummy$Class))
+```
+
+# Data Visualization
+
+## Relationship Between Stroke and Categorical Variables
+
+Note that the data was downsampled so approximately half of the training observations have had a stroke, and approximately half of the training observations have not had a stroke. If a category is split 50-50 between stroke and non-stroke observations, it is likelikely that the category does not impact the likelihood of having a stroke. 
+
+### Counts
+```{r gender and stroke count}
+# obtain counts for gender and stroke
+gender_class <- train_full %>% select(c(gender, Class))
+gender_class_count <- gender_class %>% group_by(gender, Class) %>% tally()
+# barplot of gender and stroke
+cat1a <- ggplot(data=gender_class_count, aes(x=gender, y=n)) +
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9)) +
+  ggtitle('Barplot of Gender Colored by Stroke') +
+  xlab("Gender") + ylab("Count")
+```
+```{r married and stroke count}
+# obtain counts for marriage and stroke
+married_class <- train_full %>% select(c(ever_married, Class))
+married_class_count <- married_class %>% 
+  group_by(ever_married, Class) %>% 
+  tally()
+# barplot of married and stroke
+cat2a <- ggplot(data=married_class_count, aes(x=ever_married, y=n)) +
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9)) +
+  ggtitle('Barplot of Marriage Status Colored by Stroke') +
+  xlab("Marriage Status") + ylab("Count")
+```
+```{r residence and stroke count}
+# obtain counts for residence and stroke
+Residence_class <- train_full %>% select(c(Residence_type, Class))
+Residence_class_count <- Residence_class %>% 
+  group_by(Residence_type, Class) %>% 
+  tally()
+# barplot of residence colored by stroke
+cat3a <- ggplot(data=Residence_class_count, aes(x=Residence_type, y=n)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Residence Type Colored by Stroke') +
+  xlab("Residence Type") + ylab("Count")
+```
+```{r work and stroke count}
+# obtain counts for class and stroke
+work_class <- train_full %>% select(c(work_type, Class))
+work_class_count <- work_class %>% group_by(work_type, Class) %>% tally()
+# barplot of work type and stroke
+cat4a <- ggplot(data=work_class_count, aes(x=work_type, y=n)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Work Type Colored by Stroke') +
+  xlab("Work Type") + ylab("Count")
+```
+```{r heart disease and stroke count}
+# obtain counts for heart disease and stroke
+heart_disease_class <- train_full %>% select(c(heart_disease, Class))
+heart_disease_class$heart_disease <- as.factor(heart_disease_class$heart_disease)
+heart_disease_class_count <- heart_disease_class %>% 
+  group_by(heart_disease, Class) %>%
+  tally()
+# barplot of heart disease colored by stroke
+cat5a <- ggplot(data=heart_disease_class_count, aes(heart_disease, y=n)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Heart Disease Colored by Stroke') +
+  xlab("Heart Disease") + ylab("Count")
+```
+```{r hypertension and stroke count}
+# obtain counts for hypertension and stroke
+hypertension_class <- train_full %>% select(c(hypertension, Class))
+hypertension_class$hypertension <- as.factor(hypertension_class$hypertension)
+hypertension_class_count <- hypertension_class %>% 
+  group_by(hypertension, Class) %>%
+  tally()
+# barplot of hypertension and stroke
+cat6a <- ggplot(data=hypertension_class_count, aes(x=hypertension, y=n)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Hypertension Colored by Stroke') +
+  xlab("Hypertension") + ylab("Count")
+```
+```{r cat count visualizations, fig.align=center, fig.width=10, fig.height=17}
+# output categorical variable count visualizations
+grid.arrange(cat1a, cat2a, cat3a, cat4a, cat5a, cat6a, ncol=2)
+```
+
+The barplots show categorical counts for stroke and non-stroke observations behave similarly: 
+
+* Approximately half of the subjects are female, and approximately half are male
+* Most subjects are married
+* Approximatey half of the subjects live rural, and approximately half live urban
+* Most subjects work at private companies
+* Most subjects don't have heart disease
+* Most subjects don't have hypertension
+
+### Percents
+```{r gender and stroke percent}
+# obtain percents for gender and class
+gender_class_count <- gender_class_count %>% 
+  dplyr::group_by(gender) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of gender and stroke
+cat1b <- ggplot(data=gender_class_count, aes(x=gender, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Gender Colored by Stroke') +
+  xlab("Gender") + ylab("Percent")
+```
+```{r marriage and stroke percent}
+# obtain percents for marriage and class
+married_class_count <- married_class_count %>% 
+  dplyr::group_by(ever_married) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of marriange and stroke
+cat2b <- ggplot(data=married_class_count, aes(x=ever_married, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Marriage Status Colored by Stroke') +
+  xlab("Marriage Status") + ylab("Percent")
+```
+```{r residence and stroke percent}
+# obtain percents for residence type
+Residence_class_count <- Residence_class_count %>% 
+  dplyr::group_by(Residence_type) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of residence type and stroke
+cat3b <- ggplot(data=Residence_class_count, aes(x=Residence_type, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Residence Type Colored by Stroke') +
+  xlab("Residence Type") + ylab("Percent")
+```
+```{r work and stroke percent}
+# obtain percents for work type and stroke
+work_class_count <- work_class_count %>% 
+  dplyr::group_by(work_type) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of work type and stroke
+cat4b <- ggplot(data=work_class_count, aes(x=work_type, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Work Type Colored by Stroke') +
+  xlab("Work Type") + ylab("Percent")
+```
+```{r heart disease and stroke percent}
+# obtain percents for heart disease and stroke
+heart_disease_class_count <- heart_disease_class_count %>% 
+  dplyr::group_by(heart_disease) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of heart disease and stroke
+cat5b <- ggplot(data=heart_disease_class_count, 
+                aes(x=heart_disease, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Work Type Colored by Stroke') +
+  xlab("Heart Disease") + ylab("Percent")
+```
+```{r hypertension and stroke percent}
+# obtain percents for hypertension and stroke
+hypertension_class_count <- hypertension_class_count %>% 
+  dplyr::group_by(hypertension) %>%
+  dplyr::mutate(percent=n/sum(n))
+# barplot of hypertension and stroke
+cat6b <- ggplot(data=hypertension_class_count, aes(x=hypertension, y=percent)) + 
+  geom_bar(aes(fill=Class), stat='identity', position=position_dodge(0.9))  +
+  ggtitle('Barplot of Work Type Colored by Stroke') +
+  xlab("Hypertension") + ylab("Percent")
+```
+```{r cat percent visualizations, fig.align=center, fig.width=10, fig.height=17}
+# output categorical variable percent visualizations
+grid.arrange(cat1b, cat2b, cat3b, cat4b, cat5b, cat6b, ncol=2)
+```
+
+The barplots percentages for gender, marriage status, and residence type are very similar for stroke and non-stroke patients. Therefore, I predict that these variables will not be important for determining whether someone will have a stroke. 
+
+The barplot for work type shows small differences between stroke and non-stroke observations. A slightly lower percentage of government workers have strokes, and a slightly higher percentage of self-employed people have strokes. The barplot for heart disease shows having heart disease correlates with a higher percentage of strokes. The barplot for hypertension shows having hypertension correlates with a higher percentage of strokes. 
+
+## Relationship Between Stroke and Quantitative Variables
+```{r age and stroke}
+# plot of age colored by stroke
+quant1 <- ggplot(train_full, aes(x=age)) + 
+  geom_freqpoly(aes(color=Class, linetype=Class), bins=30) + 
+  ggtitle('Age Frequency Polygon Colored by Stroke') +
+  xlab("Age") + ylab("Count")
+```
+```{r bmi and stroke}
+# plot of bmi colored by stroke
+quant2 <- ggplot(train_full, aes(x=bmi))+ 
+  geom_freqpoly(aes(color=Class, linetype=Class), bins=30) +
+  ggtitle('BMI Frequency Polygon Colored by Stroke') +
+  xlab("BMI") + ylab("Count")
+```
+```{r glucose level and stroke}
+# plot of glucose level colored by stroke
+quant3 <- ggplot(train_full, aes(x=avg_glucose_level)) + 
+                   geom_freqpoly(aes(color=Class, linetype=Class), bins=30) +
+  ggtitle('Glucose Level Frequency Polygon Colored by Stroke') +
+  xlab("Average Glucose Level") + ylab("Count")
+```
+```{r quant visualizations, fig.align=center, fig.width=10, fig.height=13}
+# output quantitative visualizations
+grid.arrange(quant1, quant2, quant3, nrow=3)
+```
+
+In general, the number of people who have had a stroke and have not had a stroke is approximately the same across the values for age, BMI, and average glucose level. However, past the age of 75, there is a higher count of people who have had a stroke. Also, at BMI levels around 35, there is a higher number of people that have had a stroke. I don't believe this is useful information since I suspect these values were originially missing, and then were imbued with the median for BMI, making there be an abnormally high count in this range. Lastly, glucose levels greater than 170 typically have higher counts for subjects with strokes. 
+
+# Machine Learning
+```{r folds for cross validation}
+set.seed(20) 
+# create folds for cross validation
+nfold <- 10
+folds <- sample(cut(1:nrow(train_dummy), breaks=nfold, labels=FALSE))
+``` 
+```{r function for calculating error rate}
+# function for calculating error rate of models
+calc_error_rate = function(predicted.value, true.value){
+  # error rate misclassification rate
+  return(mean(true.value!=predicted.value))
+}
+```
+```{r matrix for hold machine learning results}
+# matrix for holding machine learning results
+records = matrix(NA, nrow=9, ncol=2)
+colnames(records) = c("train.error","test.error")
+rownames(records) = c("Logistic Regression", "Ridge Regression", 
+                      "Lasso Regression","K Nearest Neighbors",
+                      "Decision Tree","Bagged Tree", "Random Forest",
+                      "Adaboost", "Support Vector Machine")
+```
+
+## Logistic Regression
+```{r fit logistic regression model}
+# fit logisitc regression model
+logistic <- glm(Class~., data=train_dummy, family=binomial)
+# summary of logistic regression model
+summary(logistic)
+```
+
+Analysis of logistic regression coefficients:
+
+* Age, hypertenstion, heart disease, and average glucose level have significant coefficients.
+  + This means these variables are important predictors for the probability of having a stroke.
+* BMI, being married, formally smoking, and never smoking have negative coefficients
+  + This means having a high BMI, being married, and not being an active smoker decreases the probability of having heart disease. 
+  + However, BMI may not be a useful predictor because this variable contained many missing values. 
+```{r obtain predictions for logistic regression modle}
+# predictions for logistic regression model
+logistic_train_predict_prob <- predict(logistic, train_dummy, type='response')
+logistic_test_predict_prob <- predict(logistic, test_dummy, type='response')
+```
+```{r roc curve logistic, fig.align='center', fig.width=10, fig.height=8}
+# predictions for training data
+logistic_prediction <- prediction(logistic_train_predict_prob,
+                                  train_dummy$Class)
+# performance for trainind data
+logistic_perf <- performance(logistic_prediction, measure="tpr", x.measure="fpr")
+# plot ROC curve
+plot(logistic_perf, col='red')
+abline(0,1)
+```
+```{r auc for logistic regression}
+# area under the curve
+auc <- performance(logistic_prediction, 'auc')@y.values
+auc
+```
+
+The area under the ROC curve is 0.778861 for the logistic regression model. 
+```{r logistic regression probability threshold}
+# find fpr and fnr
+fpr <- performance(logistic_prediction, 'fpr')@y.values[[1]]
+cutoff <- performance(logistic_prediction, 'fpr')@x.values[[1]]
+fnr <- performance(logistic_prediction, 'fnr')@y.values[[1]]
+rate <- as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+# calculate the euclidean distance
+rate$distance <- sqrt((rate[,2])^2+(rate[,3])^2)
+# find the minimum distance
+index <- which.min(rate$distance)
+best <- rate$Cutoff[index]
+best
+```
+
+The best cutoff probability for classifying predictions is 0.5113947. To find this probability, I calculated the Euclidean distance between (FPR,FNR) and (0,0), then I chose the threshold with the smallest distance. Having a probability near 0.5 is reasonable since half of the data has a stroke, and half does not. 
+```{r logistic plot cut off, fig.align='center', fig.width=10, fig.height=8}
+# plot cut off
+matplot(cutoff, cbind(fpr,fnr), xlab='Threshold', ylab='Error Rate', type='l', 
+        col=2:3)
+legend(0.3,1, legend=c('False Positive Rate','False Negative Rate'), col=c(2:3), 
+       lty=c(1,2))
+abline(v=best, col=4)
+```
+
+```{r logistic training predictions}
+# training predictions
+logistic_train_predict_val <- ifelse(logistic_train_predict_prob>=best, '1', '0')
+logistic_train_error <- calc_error_rate(logistic_train_predict_val,
+                                        train_dummy$Class)
+
+# training confusion matrix
+table(pred=logistic_train_predict_val, true=train_dummy$Class)
+```
+
+The confusion matrix for train data shows logistic regression has a similar performance when classifying stroke and not stroke subjects.
+```{r logistic test predictions}
+# test predictions
+logistic_test_predict_val <- ifelse(logistic_test_predict_prob>=best, '1','0')
+logistic_test_error <- calc_error_rate(logistic_test_predict_val,
+                                       test_dummy$Class)
+# add values to records matrix
+records[1,1] <- logistic_train_error
+records[1,2] <- logistic_test_error
+# confusion matrix for test
+table(pred=logistic_test_predict_val, true=test_dummy$Class)
+```
+
+The confusion matrix shows the logistic regression model has a similar performance on the test data as it has on the training data. 
+
+### Ridge Regression
+```{r inital tuning of ridge regression}
+set.seed(786)
+# tune ridge model
+cv.ridge_initial <- cv.glmnet(X_train_mat, Y_train_num, alpha=0, lambda =
+                              c(0.001,0.01,1,10), family='binomial',
+                              foldid=folds)
+# output optimal ridge lambda
+cv.ridge_initial$lambda.min
+```
+```{r final tuning of ridge regression}
+set.seed(786)
+# tune ridge model
+cv.ridge <- cv.glmnet(X_train_mat, Y_train_num, alpha=0, 
+                      lambda=c(0.005,0.007,0.01,0.05,0.07),
+                      family='binomial', foldid=folds)
+# output optimal ridge lambda
+cv.ridge$lambda.min
+```
+
+I will build my ridge regression model with a $\lambda$ of 0.01 constraining the sum of squared values of coefficients.  
+```{r fit ridge mdoel}
+# fit ridge model
+ridge <- glmnet(X_train_mat, Y_train_num, family='binomial',lambda=
+                  cv.ridge$lambda.min, alpha=0)
+# coefficeints of the model
+ridge$beta
+```
+
+Similar to logistic regression, ridge regression has negative coefficients for BMI, being married, former smoking, and never smoking. 
+```{r ridge prediction probabilities}
+# obtain prediction probabilities
+ridge_train_predict_prob <- ridge %>% predict(newx=X_train_mat, type='response')
+ridge_test_predict_prob <- ridge %>% predict(newx=X_test_mat, type='response')
+```
+```{r ridge roc curve, fig.align='center', fig.width=10, fig.height=8}
+# obtain training prediction and performances
+ridge_prediction <- prediction(ridge_train_predict_prob, train_dummy$Class)
+ridge_perf <- performance(ridge_prediction, measure="tpr", x.measure="fpr")
+# plot the ROC curve
+plot(ridge_perf, col='red')
+abline(0,1)
+```
+```{r ridge auc}
+# auc
+auc <- performance(ridge_prediction, 'auc')@y.values
+auc
+```
+The area under the ROC curve is 0.7789052 for ridge regression. 
+```{r ridge cutoff}
+# obtain fpr and fnr
+fpr <- performance(ridge_prediction, 'fpr')@y.values[[1]]
+cutoff <- performance(ridge_prediction, 'fpr')@x.values[[1]]
+fnr <- performance(ridge_prediction, 'fnr')@y.values[[1]]
+rate <- as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+# calculate the euclidean distance
+rate$distance <- sqrt((rate[,2])^2+(rate[,3])^2)
+# find the minimum distance
+index <- which.min(rate$distance)
+best <- rate$Cutoff[index]
+best
+```
+
+The cutoff probability for ridge regression is 0.5142219. 
+```{r ridge plot cut off, fig.align='center', fig.width=10, fig.height=8}
+# plot cut off
+matplot(cutoff, cbind(fpr,fnr), xlab='Threshold', ylab='Error Rate', type='l', 
+        col=2:3)
+legend(0.3,1, legend=c('False Positive Rate','False Negative Rate'), col=c(2:3), 
+       lty=c(1,2))
+abline(v=best, col=4)
+```
+
+```{r ridge training predictions}
+# training predictions
+ridge_train_predict_val <- ifelse(ridge_train_predict_prob>=best, '1','0')
+ridge_train_error <- calc_error_rate(ridge_train_predict_val, train_dummy$Class)
+# confusion matrix
+table(pred=ridge_train_predict_val, true=train_dummy$Class)
+```
+
+The confusion matrix for ridge regression has a similar performance when classifying stroke and no stroke data points. 
+```{r ridge test predictions}
+# obtain test predictions
+ridge_test_predict_val <- ifelse(ridge_test_predict_prob>=best, '1','0')
+ridge_test_error <- calc_error_rate(ridge_test_predict_val, test_dummy$Class)
+# add values to records
+records[2,1] <- ridge_train_error
+records[2,2] <- ridge_test_error
+# output confusion matrix
+table(pred=ridge_test_predict_val, true=test_dummy$Class)
+```
+
+The confusion matrix for test predictions shows ridge performs similarly on test and training data. 
+
+### Lasso Regression
+```{r initial tuning of lasso}
+set.seed(134)
+# tune ridge model
+cv.lasso_initial <- cv.glmnet(X_train_mat, Y_train_num, alpha=1, lambda =
+                              c(0.0001,0.001,0.01,1, 10), family='binomial',
+                              foldid=folds)
+# output optimal ridge lambda
+cv.lasso_initial$lambda.min
+```
+```{r final tuning of lasso}
+set.seed(134)
+# tune ridge model
+cv.lasso <- cv.glmnet(X_train_mat, Y_train_num, alpha=1, 
+                      lambda=c(0.005,0.007,0.01,0.05,0.07),
+                      family='binomial', foldid=folds)
+# output optimal ridge lambda
+cv.lasso$lambda.min
+```
+
+I will use a $\lambda$ value of 0.05 to constrain the sum of absolute valued coefficients for my lasso regression model. 
+```{r fit lasso model}
+# fit lasso model
+lasso <- glmnet(X_train_mat, Y_train_num, family='binomial',lambda=
+                  cv.lasso$lambda.min, alpha=1)
+# coefficeints of the model
+lasso$beta
+```
+
+Analysis of coefficients
+
+* being married, living in an urban household, never smoking, and currently smoking are insignifcant predictors for lasso regression.
+* BMI and formally smoking have negative coefficients. 
+```{r lasso predicted probabilities}
+# prediction probabilties for training and test data
+lasso_train_predict_prob <- lasso %>% predict(newx=X_train_mat, type='response')
+lasso_test_predict_prob <- lasso %>% predict(newx=X_test_mat, type='response')
+```
+```{r lasso roc cruve, fig.align='center', fig.width=10, fig.height=8}
+# prediction and performance of training data
+lasso_prediction <- prediction(lasso_train_predict_prob, train_dummy$Class)
+lasso_perf <- performance(lasso_prediction, measure="tpr", x.measure="fpr")
+# plot ROC curve
+plot(lasso_perf, col='red')
+abline(0,1)
+```
+
+```{r lasso auc}
+# auc
+auc <- performance(lasso_prediction, 'auc')@y.values
+auc
+```
+
+The area under the ROC curve is 0.7778229 for lasso regression.
+```{r lasso find cutoff}
+# find fpr and fnr
+fpr <- performance(lasso_prediction, 'fpr')@y.values[[1]]
+cutoff <- performance(lasso_prediction, 'fpr')@x.values[[1]]
+fnr <- performance(lasso_prediction, 'fnr')@y.values[[1]]
+rate <- as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+# calculate euclidean distance
+rate$distance <- sqrt((rate[,2])^2+(rate[,3])^2)
+# find the minimum
+index <- which.min(rate$distance)
+best <- rate$Cutoff[index]
+best
+```
+
+The cutoff probability for lasso regression is 
+```{r lasso plot cutoff, fig.align='center', fig.width=10, fig.height=8}
+# plot cutoff
+matplot(cutoff, cbind(fpr,fnr), xlab='Threshold', ylab='Error Rate', type='l', 
+        col=2:3)
+legend(0.3,1, legend=c('False Positive Rate','False Negative Rate'), col=c(2:3), 
+       lty=c(1,2))
+abline(v=best, col=4)
+```
+
+```{r lasso train values}
+# train predictions
+lasso_train_predict_val <- ifelse(lasso_train_predict_prob>=best, '1','0')
+lasso_train_error <- calc_error_rate(lasso_train_predict_val, train_dummy$Class)
+# train confusion matrix
+table(pred=lasso_train_predict_val, true=train_dummy$Class)
+```
+
+The confusion matrix shows the lasso regression model has a similar performance when predicting stroke and non-stroke observations. 
+```{r lasso test predictions}
+# test predictions
+lasso_test_predict_val <- ifelse(ridge_test_predict_prob>=best, '1','0')
+lasso_test_error <- calc_error_rate(lasso_test_predict_val, test_dummy$Class)
+# add values to records
+records[3,1] <- lasso_train_error
+records[3,2] <- lasso_test_error
+# test confusion matrix
+table(pred=lasso_test_predict_val, true=test_dummy$Class)
+```
+
+The confusion matrix shows the lasso model performs similarly on test data
+
+## K Nearest Neighbors
+
+```{r function for knn k fold cv}
+# function for k fold cv with knn
+do.chunk <- function(chunkid, folddef, Xdat, Ydat, k){
+  # split data into train and validation
+  train = (folddef!=chunkid)
+  Xtr = Xdat[train,]
+  Ytr = Ydat[train]
+  Xvl = Xdat[!train,]
+  Yvl = Ydat[!train]
+  ## get classifications for current test chunk
+  predYvl = knn(train = Xtr, test = Xvl, cl = Ytr, k = k)
+  # calculate error
+  error <- calc_error_rate(predYvl, Yvl)
+  return(error)
+}
+```
+```{r knn k fold cv for initial number of neighbors}
+set.seed(1)
+# possible number of neighbors
+kvec <- c(1,10,20,30,40,50)
+# number of folds
+CVs <- 1:10
+error.folds <- NULL
+# run k fold cv
+for (k in kvec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do.chunk(x, folds, X_train_dummy_scaled, 
+                                         Y_train, k))
+  tmp$neighbors <- k
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r knn initial number of neighbors}
+# transform format of erros
+errors <- melt(error.folds, id.vars=c('neighbors'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by neighbors
+  group_by(neighbors, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.kfold_initial <- val.error.means$neighbors
+best.kfold_initial
+```
+```{r knn k fold cv for number of neighbors}
+set.seed(1)
+# possible number of neighbors
+kvec <- c(35,47,40,43,45)
+error.folds <- NULL
+# run k fold cv
+for (k in kvec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do.chunk(x, folds, X_train_dummy_scaled, 
+                                         Y_train, k))
+  tmp$neighbors <- k
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r knn number of neighbors}
+# transform format of erros
+errors <- melt(error.folds, id.vars=c('neighbors'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by neighbors
+  group_by(neighbors, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.kfold <- val.error.means$neighbors
+best.kfold
+```
+
+I will implement K nearest neighbors using 40 neighbors to classify data points.
+```{r knn predictions}
+# training and test predictions
+knn_train_predict <- knn(train=X_train_dummy_scaled, test=X_train_dummy_scaled,
+                         cl=Y_train, k=best.kfold)
+knn_train_predict <- knn(train=X_train_dummy_scaled, test=X_test_dummy_scaled,
+                         cl=Y_train, k=best.kfold)
+# obtain errors
+knn_train_error <- calc_error_rate(knn_train_predict, Y_train)
+knn_test_error <- calc_error_rate(knn_train_predict, Y_test)
+# add values to records
+records[4,1] <- knn_train_error
+records[4,2] <- knn_test_error
+```
+
+## Decision Tree
+```{r train decision tree}
+obs <- nrow(train_dummy)
+# train decision tree
+decision_tree <- tree(Class~., data = train_full,
+                      control=tree.control(nobs=obs, mindev=0.001))
+set.seed(123)
+# use cv with folds
+cv <- cv.tree(decision_tree, folds, FUN=prune.misclass)
+# best tree size from cv
+best_size = min(cv$size[which(cv$dev == min(cv$dev))])
+# output best tree size
+best_size
+```
+
+The best tree size has 2 branches
+```{r prune tree}
+# prune tree
+decision_tree_pruned <- prune.misclass(decision_tree, best=best_size)
+```
+```{r draw tree for pruned tree, fig.align='center', fig.width=10, fig.height=8}
+# draw tree for pruned tree
+draw.tree(decision_tree_pruned, nodeinfo=TRUE,cex=0.4)
+```
+
+The decision tree classifies observations older than 66.5 as having a stroke, and younger than 66.5 as not having a stroke. 
+```{r tree obtain train and test errors}
+# make train predictions
+tree_train_predict <- predict(decision_tree_pruned, train_full, type='class')
+# obtain train error
+tree_train_error <- calc_error_rate(tree_train_predict, train_full$Class)
+# make test predictions
+tree_test_predict <- predict(decision_tree_pruned, test_full, type='class')
+# obtain test error
+tree_test_error <- calc_error_rate(tree_test_predict, test_full$Class)
+# add values to records data frame
+records[5,1] <- tree_train_error
+records[5,2] <- tree_test_error
+```
+
+## Bagging
+```{r bagged do chunk}
+# number of predictors tried at each split
+p <- ncol(train_full) - 1
+# function for k fold cv
+do_chunk_bag <- function(k, df, folddef, t){
+  # make train and validation data sets
+  train <- (folddef!=k)
+  train_df <- df[train,]
+  val_df <- df[!train,]
+  # train the model
+  model <- randomForest(Class~., data=train_df, ntree=t, mtry=p)
+  # obtain predictions
+  predVal <- predict(model, newdata=val_df)
+  # calculate misclassification rate
+  error <- calc_error_rate(predVal, val_df$Class)
+  return(error)
+}
+```
+```{r bagged k fold cv initial}
+set.seed(67)
+# possible number of neighbors
+treevec <- c(50,100,300,400,500,700)
+error.folds <- NULL
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_bag(x, train_full, folds, t))
+  tmp$size <- t
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r bagged tree size initial}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.tree_initial <- min(val.error.means$size)
+best.tree_initial
+```
+```{r bagged k fold cv}
+set.seed(67)
+# possible number of neighbors
+treevec <- c(400,450,500,550,600)
+error.folds <- NULL
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_bag(x, train_full, folds, t))
+  tmp$size <- t
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r bagged tree size}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.tree <- min(val.error.means$size)
+best.tree
+```
+
+I will fit the bagged tree model with 400 trees. 
+```{r bagged, fig.align='center', fig.width=10, fig.height=8}
+# fit bagged
+bagged <- randomForest(Class~., data=train_full, ntree=best.tree,
+                              importance=TRUE, mtry=p)
+# plot error vs number of trees
+plot(bagged)
+```
+
+Misclassification error decreases as the number of trees increases. 
+```{r bagged predictions}
+# obtain train error
+bagged_train_error <- calc_error_rate(bagged$predicted, Y_train)
+# make test predictions
+bagged_test_predict <- predict(bagged, newdata=test_full)
+# obtain test error
+bagged_test_error <- calc_error_rate(bagged_test_predict, Y_test)
+# add values to records
+records[6,1] <- bagged_train_error
+records[6,2] <- bagged_test_error
+```
+
+## Random Forest
+```{r random forest do chunk}
+# random forest cross validation function
+do_chunk_rf <- function(k, df, folddef, t){
+  # get train and validation sets
+  train <- (folddef!=k)
+  train_df <- df[train,]
+  val_df <- df[!train,]
+  # fit model
+  model <- randomForest(Class~., data=train_df, ntree=t)
+  # get predictions
+  predVal <- predict(model, newdata=val_df)
+  # calculate error
+  error <- calc_error_rate(predVal, val_df$Class)
+  return(error)
+}
+```
+```{r random forest cross validation initial}
+set.seed(14)
+# number of trees to try
+treevec <- c(50,100,300,500,700)
+# data frame to hold errors for each cross validation
+error.folds <- NULL
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_rf(x, train_full, folds, t))
+  tmp$size <- t
+  # add row to error.folds
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r random forest tree size inital}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of trees iniital
+best.tree_initial <- min(val.error.means$size)
+best.tree_initial
+```
+```{r random cross validation}
+set.seed(14)
+# number of trees to try
+treevec <- c(200,250,300,350,400)
+# data frame to hold errors for each fold of cross validation
+error.folds <- NULL
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_rf(x, train_full, folds, t))
+  tmp$size <- t
+  # add row to error.folds
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r get best number of trees}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of trees
+best.tree <- min(val.error.means$size)
+best.tree
+```
+```{r random forest fit, fig.align='center', fig.width=10, fig.height=8}
+# fit random forest
+random_forest <- randomForest(Class~., data=train_full, ntree=best.tree,
+                              importance=TRUE)
+# plot error rates as a function of trees
+plot(random_forest)
+```
+
+As the number of trees increases, the error decreases
+```{r random forest importance, fig.align='center', fig.width=10, fig.height=8}
+# variable importance
+varImpPlot(random_forest, sort=TRUE, main='Variable Importance', n.var=10)
+```
+
+Age is an important predictor for improving accuracy. Age, average glucose level, and bmi are important predictors for improving Gini index. 
+```{r random forest predictions}
+# obtain train error
+forest_train_error <- calc_error_rate(random_forest$predicted, Y_train)
+# make test predictions
+forest_test_predict <- predict(random_forest, newdata=test_full)
+# obtain test error
+forest_test_error <- calc_error_rate(forest_test_predict, Y_test)
+# add values to records
+records[7,1] <- forest_train_error
+records[7,2] <- forest_test_error
+```
+## Adaboost
+```{r boost do chunk}
+# boost function for k fold cv
+do_chunk_boost <- function(k, df, folddef, t){
+  # make train and validation data
+  train <- (folddef!=k)
+  train_df <- df[train,]
+  val_df <- df[!train,]
+  # fit model
+  model <- gbm(ifelse(Class=='1',1,0)~.,data=train_df, distribution='bernoulli',
+               n.trees=t)
+  # obtain prediction probabilities
+  pred_prob <- predict(model, newdata=train_df, type='response', n.trees=t)
+  prob_prediction <- prediction(pred_prob, train_df$Class)
+  fpr <- performance(prob_prediction, 'fpr')@y.values[[1]]
+  cutoff <- performance(prob_prediction, 'fpr')@x.values[[1]]
+  fnr <- performance(prob_prediction, 'fnr')@y.values[[1]]
+  rate <- as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+  # find best cut off
+  rate$distance <- sqrt((rate[,2])^2+(rate[,3])^2)
+  index <- which.min(rate$distance)
+  best <- rate$Cutoff[index]
+  # find predictions
+  pred_val_prob <- predict(model, newdata=val_df, type='response', n.trees=t)
+  pred_val <- ifelse(pred_val_prob>=best, '1','0')
+  # calculate error
+  error <- calc_error_rate(pred_val, val_df$Class)
+  return(error)
+}
+```
+```{r boost inital k fold cv}
+set.seed(743)
+# possible number of neighbors
+treevec <- c(50,100,300,500,700)
+error.folds <- NULL
+# k fold cv
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_boost(x, train_full, folds, t))
+  tmp$size <- t
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r boost initial tree size}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.tree_initial <- min(val.error.means$size)
+best.tree_initial
+```
+```{r boost k fold cv}
+set.seed(743)
+# possible number of neighbors
+treevec <- c(70,80,100,150,200)
+error.folds <- NULL
+# 10 fold cv
+for (t in treevec){
+  # apply do.chunk to each fold
+  tmp <- ldply(CVs, function(x) do_chunk_rf(x, train_full, folds, t))
+  tmp$size <- t
+  error.folds <- rbind(error.folds, tmp)
+}
+```
+```{r boost number of trees}
+errors <- melt(error.folds, id.vars=c('size'), value.name='error')
+# choose number of neighbors that minimizes validataion error
+val.error.means <- errors %>%
+  # group selected data frame by tree size
+  group_by(size, variable) %>%
+  # calculate the CV rate for each k
+  summarise_each(funs(mean), error) %>%
+  # remove existing group
+  ungroup() %>%
+  filter(error==min(error))
+# get best number of neighbors
+best.tree <- min(val.error.means$size)
+best.tree
+```
+
+I will fit Adaboost with 400 trees. 
+```{r fit boost model, fig.align='center', fig.width=10, fig.height=8}
+set.seed(908)
+# fit boost model
+boost <- gbm(ifelse(Class=='1',1,0)~.,data=train_full, distribution='bernoulli',
+             n.trees=best.tree)
+# summary of boost model
+summary(boost)
+```
+
+The variable with the largest relative influence for the Adaboost model is age. Variables with no relative influence are gender, marraige status, and residence type. 
+```{r boost predicted probabilities}
+# predicted probabilities for train and test
+boost_train_predict_prob <- boost %>% 
+  predict(newdata=train_full, type='response', n.trees=best.tree)
+boost_test_predict_prob <- boost %>% 
+  predict(newdata=train_full, type='response', n.trees=best.tree)
+```
+
+```{r boost roc}
+# obtain prediction and performance of train data
+boost_prediction <- prediction(boost_train_predict_prob, Y_train)
+boost_perf <- performance(boost_prediction, measure="tpr", x.measure="fpr")
+# plot roc curve
+plot(lasso_perf, col='red')
+abline(0,1)
+```
+```{r boost auc}
+# auc
+auc <- performance(boost_prediction, 'auc')@y.values
+auc
+```
+
+The area under the ROC curve is 0.7930902 for the Adaboost model. 
+```{r boost cut off}
+# obtain fpr and fnr
+fpr <- performance(boost_prediction, 'fpr')@y.values[[1]]
+cutoff <- performance(boost_prediction, 'fpr')@x.values[[1]]
+fnr <- performance(boost_prediction, 'fnr')@y.values[[1]]
+rate <- as.data.frame(cbind(Cutoff=cutoff, FPR=fpr, FNR=fnr))
+# obtain euclidean distance
+rate$distance <- sqrt((rate[,2])^2+(rate[,3])^2)
+# obtain minimum
+index <- which.min(rate$distance)
+best <- rate$Cutoff[index]
+best
+```
+
+The cutoff for classification is 0.5633757 for the Adaboost model. 
+```{r boost plot cutoff, fig.align='center', fig.width=10, fig.height=8}
+# plot cut off
+matplot(cutoff, cbind(fpr,fnr), xlab='Threshold', ylab='Error Rate', type='l', 
+        col=2:3)
+legend(0.3,1, legend=c('False Positive Rate','False Negative Rate'), col=c(2:3), 
+       lty=c(1,2))
+abline(v=best, col=4)
+```
+
+```{r boost train predictions}
+# predictions for train data
+boost_train_predict_val <- ifelse(boost_train_predict_prob>=best, '1','0')
+boost_train_error <- calc_error_rate(boost_train_predict_val, Y_train)
+# confusion matrix of train data
+table(pred=boost_train_predict_val, true=Y_train)
+```
+
+The confusion matrix shows Adaboost performs similarly when classifying stroke and non-stroke observations. 
+```{r boost test predictions}
+# predictions for test data
+boost_test_predict_val <- ifelse(ridge_test_predict_prob>=best, '1','0')
+boost_test_error <- calc_error_rate(boost_test_predict_val, Y_test)
+# add results to records
+records[8,1] <- boost_train_error
+records[8,2] <- boost_test_error
+# confusion matrix of test data
+table(pred=boost_test_predict_val, true=Y_test)
+```
+
+The confusion matrix shows Adaboost has a similar performance on train and test data.
+
+## Support Vector Machine
+```{r SVM parameter tuning initial}
+set.seed(131)
+# initial tune of SVM
+tune.out_initial <- tune.svm(Class~., data=train_dummy_scaled, kernel='linear',
+                             cost=c(0.001,0.01,0.1,1,10,50))
+tune.out_initial$best.parameters$cost
+```
+```{r SVM parameter tuning}
+set.seed(131)
+# tune SVM
+tune.out_initial <- tune.svm(Class~., data=train_dummy_scaled, kernel='linear',
+                             cost=c(5,7,10,15,20,30))
+tune.out_initial$best.parameters$cost
+```
+
+I will fit the support vector machine model with a budget tuning parameter of 5. 
+```{r SVM best model}
+support_vector_machine <- tune.out$best.model
+# make train predictions
+svm_train_predict <- predict(support_vector_machine, newdata=train_dummy_scaled,
+                             type='class')
+# obtain train error
+svm_train_error <- calc_error_rate(svm_train_predict, Y_train)
+# make test predictions
+svm_test_predict <- predict(support_vector_machine, newdata=test_dummy,
+                            type='class')
+# obtain test error
+svm_test_error <- calc_error_rate(svm_test_predict, Y_test)
+# add values to records
+records[9,1] <- svm_train_error
+records[9,2] <- svm_test_error
+```
+
+# Conclusion
+
+## Analysis of the Models
+```{r output results from models}
+# output results from models
+records
+```
+
+Most models misclassify new data around 28% of the time. Unfortunately, this means these models are not very accurate. When examining the visualizations, I saw some key indicators, like having heart disease, correlate with having strokes. However, many subjects also have strokes without possessing one of the key indicators. This means this data is challenging for models to learn. Additionally, having not many observations poses a challenge for training non-parametric models like K nearest neighbors and random forests. 
+
+When examining the results of each model, I noticed that some models have lower test errors than train errors. This occurrence is a negative consequence of having too few observations. K Nearest Neighbors has a much lower test error than train error, meaning the model did not properly learn the data and is not acceptable for future use. Support Vector Machine had a much higher test error than train error, meaning the model overfit to the train data. 
+
+I recommend using the Adaboost model to predict whether a subject has had a stroke. This model has the lowest test error, and its test error is higher than its train error. Thus, it is the most appropriate model I made. 
+
+## Analysis of Predictors
+
+In most models, important predictors included age, heart disease, bmi, and average glucose levels. Thus, doctors should be aware of values for these variables when assessing whether patients are at risk of stroke.
+
+# Ways to Improve
+
+## Data Cleaning
+### Age Cut Off
+I chose to consider observations with age greater than or equal to the first percentile of age in my data. However, using Bayesian analysis would be a better method than solely relying on the data. 
+
+To do this, I would specify a prior distribution for my belief of a reasonable minimum age that one should worry about having a stroke. Then, I would use my data to update this parameter. I would determine the age cut off by using the mean, a Bayes estimator that minimizes the squared loss function. 
+### Imbalanced Data
+Downsampling my data made me lose a lot of information about people who have not had a stroke. Instead, I could have used a different method that let me keep more of my data. Here are some other techniques I could have tried:
+
+* Define a loss function that penalizes models more for misclassifying Class=1
+* Use random over sampling to generate artificial data for strokes
