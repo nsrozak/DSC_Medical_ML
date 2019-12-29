@@ -2,7 +2,7 @@
 title: "Medical ML"
 author: "Natalie Rozak"
 date: "12/21/2019"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -155,7 +155,7 @@ Steps to Prepare Data for Machine Learning
   + Scaled predictors for distance models
   + Matrix format
 
-```{r number of observations that have and don't have a stroke}
+```{r number of observations that have and dont have a stroke}
 # number of observations that have not had a stroke
 length(model_data$stroke[model_data$stroke==0])
 # number of observations that 
@@ -294,7 +294,7 @@ cat6a <- ggplot(data=hypertension_class_count, aes(x=hypertension, y=n)) +
   ggtitle('Barplot of Hypertension Colored by Stroke') +
   xlab("Hypertension") + ylab("Count")
 ```
-```{r cat count visualizations, fig.align=center, fig.width=10, fig.height=17}
+```{r cat count visualizations, fig.align='center', fig.width=10, fig.height=17}
 # output categorical variable count visualizations
 grid.arrange(cat1a, cat2a, cat3a, cat4a, cat5a, cat6a, ncol=2)
 ```
@@ -376,7 +376,7 @@ cat6b <- ggplot(data=hypertension_class_count, aes(x=hypertension, y=percent)) +
   ggtitle('Barplot of Work Type Colored by Stroke') +
   xlab("Hypertension") + ylab("Percent")
 ```
-```{r cat percent visualizations, fig.align=center, fig.width=10, fig.height=17}
+```{r cat percent vis, fig.align='center', fig.width=10, fig.height=17}
 # output categorical variable percent visualizations
 grid.arrange(cat1b, cat2b, cat3b, cat4b, cat5b, cat6b, ncol=2)
 ```
@@ -407,7 +407,7 @@ quant3 <- ggplot(train_full, aes(x=avg_glucose_level)) +
   ggtitle('Glucose Level Frequency Polygon Colored by Stroke') +
   xlab("Average Glucose Level") + ylab("Count")
 ```
-```{r quant visualizations, fig.align=center, fig.width=10, fig.height=13}
+```{r quant visualizations, fig.align='center', fig.width=10, fig.height=13}
 # output quantitative visualizations
 grid.arrange(quant1, quant2, quant3, nrow=3)
 ```
@@ -1230,9 +1230,9 @@ tune.out_initial$best.parameters$cost
 ```{r SVM parameter tuning}
 set.seed(131)
 # tune SVM
-tune.out_initial <- tune.svm(Class~., data=train_dummy_scaled, kernel='linear',
+tune.out <- tune.svm(Class~., data=train_dummy_scaled, kernel='linear',
                              cost=c(5,7,10,15,20,30))
-tune.out_initial$best.parameters$cost
+tune.out$best.parameters$cost
 ```
 
 I will fit the support vector machine model with a budget tuning parameter of 5. 
